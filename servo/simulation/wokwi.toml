@@ -1,0 +1,4 @@
+[wokwi]
+version = 1
+elf = '../target/thumbv6m-none-eabi/release/pi-pico-servo'
+firmware = '../target/thumbv6m-none-eabi/release/pi-pico-servo.uf2'
