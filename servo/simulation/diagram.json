@@ -9,9 +9,9 @@
   "connections": [
     [ "pico:GP0", "$serialMonitor:RX", "", [] ],
     [ "pico:GP1", "$serialMonitor:TX", "", [] ],
-    [ "servo1:GND", "pico:3V3", "red", [ "h-9.6", "v-48" ] ],
     [ "servo1:PWM", "pico:GP27", "green", [ "h-67.2", "v0.2" ] ],
-    [ "servo1:V+", "pico:VBUS", "black", [ "h-67.2", "v-57.5" ] ]
+    [ "servo1:V+", "pico:VBUS", "red", [ "h-67.2", "v-57.5" ] ],
+    [ "servo1:GND", "pico:GND.8", "black", [ "h-48", "v-35.15" ] ]
   ],
   "dependencies": {}
 }
