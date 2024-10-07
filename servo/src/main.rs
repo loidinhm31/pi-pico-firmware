@@ -1,87 +1,40 @@
 #![no_std]
 #![no_main]
 
-use rp_pico as bsp;
-
-use bsp::entry;
-
-use bsp::hal::{
-    clocks::{init_clocks_and_plls, Clock},
-    pac,
-    prelude::*,
-    sio::Sio,
-    watchdog::Watchdog,
-};
-use cortex_m::prelude::_embedded_hal_PwmPin;
-use defmt::*;
+use embassy_executor::Spawner;
+use embassy_rp::clocks;
+use embassy_rp::pwm::{Config as PwmConfig, Pwm};
+use embassy_time::Timer;
+use fixed::types::extra::U4;
+use fixed::FixedU16;
 
 #[allow(unused_imports)]
-use defmt_rtt as _;
-#[allow(unused_imports)]
-use panic_probe as _;
+use {defmt_rtt as _, panic_probe as _};
 
+#[embassy_executor::main]
+async fn main(_spawner: Spawner) {
+    let p = embassy_rp::init(Default::default());
 
-#[entry]
-fn main() -> ! {
-    info!("Program start");
+    // Configure and initialize PWM module
+    // Integer part
+    let int_part: u16 = 100;
+    // Fractional part (3/16 corresponds to 3 in the 4-bit fractional representation)
+    let frac_part: u16 = 0;
+    let value_bits: u16 = (int_part << 4) | frac_part;
+    let divider: FixedU16<U4> = FixedU16::from_bits(value_bits);
 
-    // Grab our singleton objects
-    let mut pac = pac::Peripherals::take().unwrap();
-    let core = pac::CorePeripherals::take().unwrap();
-
-    // Set up the watchdog driver - needed by the clock setup code
-    let mut watchdog = Watchdog::new(pac.WATCHDOG);
-
-    // Configure the clocks
-    //
-    // The default is to generate a 125 MHz system clock
-    let clocks = init_clocks_and_plls(
-        rp_pico::XOSC_CRYSTAL_FREQ,
-        pac.XOSC,
-        pac.CLOCKS,
-        pac.PLL_SYS,
-        pac.PLL_USB,
-        &mut pac.RESETS,
-        &mut watchdog,
-    )
-        .unwrap();
-
-    // The single-cycle I/O block controls our GPIO pins
-    let sio = Sio::new(pac.SIO);
-
-    // Set the pins up according to their function on this particular board
-    let pins = bsp::Pins::new(
-        pac.IO_BANK0,
-        pac.PADS_BANK0,
-        sio.gpio_bank0,
-        &mut pac.RESETS,
-    );
-
-    let system_clock_hz = clocks.system_clock.freq().to_Hz();
-
-    // The delay object lets us wait for specified amounts of time (in
-    // milliseconds)
-    let mut delay = cortex_m::delay::Delay::new(core.SYST, system_clock_hz);
-
-    // Init PWMs
-    let mut pwm_slices = bsp::hal::pwm::Slices::new(pac.PWM, &mut pac.RESETS);
-
-    // Configure PWM5
-    let pwm = &mut pwm_slices.pwm5;
-    pwm.enable();
-
+    let system_clock_hz = clocks::clk_sys_freq();
     let period = 20_u32;
     let pwm_freq_hz = 1000 / period; // Desired PWM frequency is 50 Hz (Period = 20 ms) f = 1/t
     let pwd_divider = 100;
     let top_value = calculate_pwm_top(system_clock_hz, pwm_freq_hz, pwd_divider);
 
-    pwm.set_top(top_value as u16);
-    pwm.set_div_int(pwd_divider as u8);
-    pwm.set_div_frac(0);
-
-    // Output channel B on PWMt to GPIO 27
-    let channel = &mut pwm.channel_b;
-    channel.output_to(pins.gpio27);
+    // Single Arm has 3 joints: init Config & Pwm for first 2 joints
+    let mut c0: PwmConfig = Default::default();
+    c0.divider = divider;
+    c0.top = top_value as u16;
+    let mut pwm0 = Pwm::new_output_b(p.PWM_CH5, p.PIN_27, c0.clone());
+    // Init Pio Servo for 3rd join
 
     // Set duty cycle to make the servo move (pulse width for servos)
     let min_limit = ((top_value * 500) / (period * 1000)) as u16; // ~2.5% duty (500 µs / 20 ms)
@@ -89,24 +42,21 @@ fn main() -> ! {
 
     // Infinite loop, rotating the servo left or right
     // SG90-HV datasheet
-    // Right Max: 25000 *  5.0% = 625
+    // Right Max: 25000 *  2.5% = 625
     // Stop     : 25000 *  7.5% = 1875
     // Left  Max: 25000 * 12.0% = 3000
     loop {
         for angle in 0..=180 {
-            if angle % 5 == 0 {
-                channel.set_duty(map_angle_to_duty(angle, 0, 180, min_limit as u32, max_limit as u32) as u16);
-                delay.delay_ms(5);
-            }
+            c0.compare_b = map_angle_to_duty(angle, 0, 180, min_limit as u32, max_limit as u32) as u16;
+            pwm0.set_config(&c0);
+            Timer::after_millis(12).await;
         }
-
+        //
         for angle in (0..=180).rev() {
-            if angle % 5 == 0 {
-                channel.set_duty(map_angle_to_duty(angle, 0, 180, min_limit as u32, max_limit as u32) as u16);
-                delay.delay_ms(5);
-            }
+            c0.compare_b = map_angle_to_duty(angle, 0, 180, min_limit as u32, max_limit as u32) as u16;
+            pwm0.set_config(&c0);
+            Timer::after_millis(12).await;
         }
-        delay.delay_ms(500);
     }
 }
 
@@ -134,4 +84,3 @@ fn map_angle_to_duty(deg: u32, in_min: u32, in_max: u32, out_min: u32, out_max: 
         out_min + ((deg - in_min) * (out_max - out_min) / (in_max - in_min))
     }
 }
-
