@@ -12,3 +12,5 @@ target = "thumbv6m-none-eabi"        # Cortex-M0 and Cortex-M0+
 DEFMT_LOG = "debug"
 WIFI_SSID = "WIFI_SSID"
 WIFI_PASSWORD = "WIFI_PASSWORD"
+MQTT_USERNAME = "MQTT_USERNAME"
+MQTT_PASSWORD = "MQTT_PASSWORD"

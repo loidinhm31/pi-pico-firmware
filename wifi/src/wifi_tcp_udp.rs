@@ -19,10 +19,6 @@ use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_time::{Duration, Instant, Timer};
 use embedded_io_async::Write;
 use rand::RngCore;
-use rust_mqtt::client::client::MqttClient;
-use rust_mqtt::client::client_config::ClientConfig;
-use rust_mqtt::packet::v5::reason_codes::ReasonCode;
-use rust_mqtt::utils::rng_generator::CountingRng;
 use static_cell::StaticCell;
 
 use {defmt_rtt as _, panic_probe as _};
@@ -65,10 +61,13 @@ async fn main(spawner: Spawner) {
 
     let wifi_ssid = env!("WIFI_SSID");
     let wifi_password = env!("WIFI_PASSWORD");
-    let mqtt_username = env!("MQTT_USERNAME");
-    let mqtt_password = env!("MQTT_PASSWORD");
 
     let config = Config::dhcpv4(Default::default());
+    // let config = Config::ipv4_static(embassy_net::StaticConfigV4 {
+    //     address: embassy_net::Ipv4Cidr::new(embassy_net::Ipv4Address::new(192, 168, 1, 249), 16),
+    //     dns_servers: heapless::Vec::new(),
+    //     gateway: None,
+    // });
 
     // Generate random seed
     let seed = rng.next_u64();
@@ -118,7 +117,8 @@ async fn main(spawner: Spawner) {
     }
 
     // And now we can use it!
-    let server_name = "192.168.1.120";
+    let server_name = "192.168.1.114";
+    let comm_port = 9932;
     let server_address = stack
         .dns_query(server_name, embassy_net::dns::DnsQueryType::A)
         .await
@@ -130,62 +130,44 @@ async fn main(spawner: Spawner) {
         server_name, dest
     );
 
-    // MQTT setup
     let mut rx_buffer = [0; 4096];
     let mut tx_buffer = [0; 4096];
-    let mut mqtt_socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-    mqtt_socket
-        .connect(IpEndpoint::new(dest, 1883))
+    let mut msg_buffer = [0; 128];
+
+    let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+    socket
+        .connect(IpEndpoint::new(dest, comm_port))
         .await
         .unwrap();
 
-    let mut mqtt_rx_buffer = [0; 1024];
-    let mut mqtt_tx_buffer = [0; 1024];
 
-    let mut config = ClientConfig::new(
-        rust_mqtt::client::client_config::MqttVersion::MQTTv5,
-        CountingRng(20000),
+    let tx_size = socket.write("test".as_bytes()).await.unwrap();
+    info!("Wrote {} byes to the server", tx_size);
+    let rx_size = socket.read(&mut msg_buffer).await.unwrap();
+    let response = from_utf8(&msg_buffer[..rx_size]).unwrap();
+    info!("Server replied with {}", response);
+
+    socket.close();
+
+    // Reuse the earlier msg_buffer since we're done with the TCP part
+    let mut udp_rx_meta = [PacketMetadata::EMPTY; 16];
+    let mut udp_rx_buffer = [0; 1024];
+    let mut udp_tx_meta = [PacketMetadata::EMPTY; 16];
+    let mut udp_tx_buffer = [0; 1024];
+
+    let mut udp_socket = UdpSocket::new(
+        stack,
+        &mut udp_rx_meta,
+        &mut udp_rx_buffer,
+        &mut udp_tx_meta,
+        &mut udp_tx_buffer,
     );
-    config.add_client_id("pico_w");
-    config.add_username(mqtt_username);
-    config.add_password(mqtt_password);
 
-
-    let mut mqtt_client = MqttClient::<_, 5, _>::new(
-        mqtt_socket,
-        &mut mqtt_rx_buffer,
-        1024,
-        &mut mqtt_tx_buffer,
-        1024,
-        config,
-    );
-
-    // Set up MQTT connection with authentication
-    let connect_result = mqtt_client
-        .connect_to_broker()
-        .await;
-
-    let subscribe_result = mqtt_client.subscribe_to_topic("topic/test0").await;
+    udp_socket.bind(0).unwrap();
 
     loop {
-        match mqtt_client.receive_message().await {
-            Ok((topic, payload)) => {
-                // Publish a message
-                let publish_result = mqtt_client.send_message(
-                    "topic/test1",
-                    b"Hello from Pico W!",
-                    rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
-                    false)
-                    .await;
-                match publish_result {
-                    Ok(()) => defmt::info!("Published message"),
-                    Err(e) => defmt::error!("Failed to publish: {:?}", e),
-                }
-            },
-            (_) => {
-
-            }
-        }
+        // test_tcp(&mut socket, &mut control, &mut msg_buffer).await;
+        test_udp(&mut udp_socket, &mut control, &mut msg_buffer, &dest, comm_port).await;
     }
 }
 
@@ -197,4 +179,62 @@ async fn cyw43_task(runner: cyw43::Runner<'static, Output<'static>, PioSpi<'stat
 #[embassy_executor::task]
 async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'static>>) -> ! {
     runner.run().await
+}
+
+
+async fn test_tcp(socket: &mut TcpSocket<'_>, control: &mut cyw43::Control<'_>, msg_buffer: &mut [u8]) {
+    socket.set_timeout(Some(Duration::from_secs(10)));
+
+    control.gpio_set(0, false).await;
+    info!("Listening on TCP:1234...");
+    if let Err(e) = socket.accept(1234).await {
+        warn!("accept error: {:?}", e);
+    }
+
+    info!("Received connection from {:?}", socket.remote_endpoint());
+    control.gpio_set(0, true).await;
+
+    loop {
+        let n = match socket.read(msg_buffer).await {
+            Ok(0) => {
+                warn!("read EOF");
+                break;
+            }
+            Ok(n) => n,
+            Err(e) => {
+                warn!("read error: {:?}", e);
+                break;
+            }
+        };
+
+        info!("rxd {}", from_utf8(&msg_buffer[..n]).unwrap());
+
+        match socket.write_all(&msg_buffer[..n]).await {
+            Ok(()) => {}
+            Err(e) => {
+                warn!("write error: {:?}", e);
+                break;
+            }
+        };
+    }
+}
+
+async fn test_udp(udp_socket: &mut UdpSocket<'_>, control: &mut cyw43::Control<'_>, msg_buffer: &mut [u8], dest: &IpAddress, comm_port: u16) {
+    info!("external LED on, onboard LED off!");
+    control.gpio_set(0, false).await;
+    info!("sending UDP packet");
+    udp_socket
+        .send_to("test".as_bytes(), IpEndpoint::new(*dest, comm_port))
+        .await
+        .unwrap();
+    Timer::after(Duration::from_secs(1)).await;
+
+    info!("external LED off, onboard LED on!");
+    control.gpio_set(0, true).await;
+    if udp_socket.may_recv() {
+        let (rx_size, from_addr) = udp_socket.recv_from(msg_buffer).await.unwrap();
+        let response = from_utf8(&msg_buffer[..rx_size]).unwrap();
+        info!("Server replied with {} from {}", response, from_addr);
+    }
+    Timer::after(Duration::from_secs(1)).await;
 }

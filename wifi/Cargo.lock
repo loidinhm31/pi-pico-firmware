@@ -1156,6 +1156,7 @@ dependencies = [
  "panic-probe",
  "portable-atomic",
  "rand",
+ "rust-mqtt",
  "static_cell",
 ]
 
@@ -1252,9 +1253,9 @@ dependencies = [
 
 [[package]]
 name = "proc-macro2"
-version = "1.0.86"
+version = "1.0.87"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e719e8df665df0d1c8fbfd238015744736151d4445ec0836b8e628aae103b77"
+checksum = "b3e4daa0dcf6feba26f985457cdf104d4b4256fc5a09547140f3631bb076b19a"
 dependencies = [
  "unicode-ident",
 ]
@@ -1354,6 +1355,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c92f344f63f950ee36cf4080050e4dce850839b9175da38f9d2ffb69b4dbb21"
 dependencies = [
  "crc-any",
+]
+
+[[package]]
+name = "rust-mqtt"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f71160765f368fd9a84e0955e2ddb6d64ac9018fee1c5323354d6d08c816b40"
+dependencies = [
+ "defmt",
+ "embedded-io",
+ "embedded-io-async",
+ "heapless",
+ "rand_core",
 ]
 
 [[package]]
