@@ -2,9 +2,7 @@
 #![no_main]
 #![allow(async_fn_in_trait)]
 
-use core::mem::MaybeUninit;
 use core::str;
-use core::str::from_utf8;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use cyw43::{Control, JoinOptions};
@@ -20,8 +18,7 @@ use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
-use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Timer};
 use rand::RngCore;
 use rust_mqtt::client::client::MqttClient;
 use rust_mqtt::client::client_config::ClientConfig;
@@ -49,6 +46,10 @@ enum JsonError {
 }
 static CONTROL: StaticCell<Control<'static>> = StaticCell::new();
 static STACK: StaticCell<Stack<'static>> = StaticCell::new();
+
+static WIFI_CONNECTION_UP: AtomicBool = AtomicBool::new(false);
+static DNS_QUERY_RESULT: Mutex<CriticalSectionRawMutex, Option<IpAddress>> = Mutex::new(None);
+
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -138,31 +139,8 @@ async fn main(spawner: Spawner) {
     let stack = STACK.init(stack);
     let control = CONTROL.init(control);
 
-    unwrap!(spawner.spawn(wifi_task(control, stack, wifi_ssid, wifi_password)));
-    unwrap!(spawner.spawn(mqtt_task(stack, mqtt_server_name, mqtt_server_port, mqtt_username, mqtt_password)));
-
-    let server_address = stack
-        .dns_query(mqtt_server_name, embassy_net::dns::DnsQueryType::A)
-        .await
-        .unwrap();
-
-    let dest: IpAddress = server_address.first().unwrap().clone();
-    info!(
-        "Our server named {} resolved to the address {}",
-        mqtt_server_name, dest
-    );
-
-    let comm_port = 9932;
-    let server_address = stack
-        .dns_query(mqtt_server_name, embassy_net::dns::DnsQueryType::A)
-        .await
-        .unwrap();
-
-    let dest: IpAddress = server_address.first().unwrap().clone();
-    info!(
-        "Our server named {} resolved to the address {}",
-        mqtt_server_name, dest
-    );
+    unwrap!(spawner.spawn(wifi_task(control, stack, mqtt_server_name)));
+    unwrap!(spawner.spawn(mqtt_task(stack, mqtt_server_port, mqtt_username, mqtt_password)));
 
     loop {
         Timer::after(Duration::from_secs(1)).await;
@@ -183,8 +161,7 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
 async fn wifi_task(
     control: &'static mut Control<'static>,
     stack: &'static Stack<'static>,
-    ssid: &'static str,
-    password: &'static str,
+    mqtt_server_name: &'static str,
 ) {
     const CHECK_INTERVAL_CONNECTED: Duration = Duration::from_secs(10);  // Check every ? seconds when connected
     const CHECK_INTERVAL_DISCONNECTED: Duration = Duration::from_secs(5);  // Check every 5 seconds when disconnected
@@ -197,18 +174,33 @@ async fn wifi_task(
 
         info!("Checking WiFi connection...");
 
-        let is_connected = stack.is_link_up();
-
-        if !is_connected {
-            info!("WiFi disconnected. Attempting to reconnect...");
-            Timer::after(Duration::from_millis(5000)).await;
-        } else {
-            info!("WiFi connected...");
-
-            Timer::after(Duration::from_millis(1000)).await;
-            check_interval = CHECK_INTERVAL_CONNECTED;
+        // Perform DNS query once for both connection check and address retrieval
+        match stack.dns_query(mqtt_server_name, embassy_net::dns::DnsQueryType::A).await {
+            Ok(addresses) => {
+                if let Some(dest) = addresses.first().cloned() {
+                    info!("DNS query successful. Server IP: {}", dest);
+                    *DNS_QUERY_RESULT.lock().await = Some(dest);
+                    WIFI_CONNECTION_UP.store(true, Ordering::SeqCst);
+                    check_interval = CHECK_INTERVAL_CONNECTED;
+                    Timer::after(Duration::from_millis(1000)).await;
+                } else {
+                    error!("DNS query successful but no addresses returned");
+                    info!("WiFi disconnected or DNS query failed. Attempting to reconnect...");
+                    WIFI_CONNECTION_UP.store(false, Ordering::SeqCst);
+                    *DNS_QUERY_RESULT.lock().await = None;
+                    check_interval = CHECK_INTERVAL_DISCONNECTED;
+                    Timer::after(Duration::from_millis(5000)).await;
+                }
+            }
+            Err(e) => {
+                error!("DNS query failed: {:?}", e);
+                info!("WiFi disconnected or DNS query failed. Attempting to reconnect...");
+                WIFI_CONNECTION_UP.store(false, Ordering::SeqCst);
+                *DNS_QUERY_RESULT.lock().await = None;
+                check_interval = CHECK_INTERVAL_DISCONNECTED;
+                Timer::after(Duration::from_millis(5000)).await;
+            }
         }
-
         control.gpio_set(0, false).await;
 
         // Sleep for the determined interval
@@ -219,14 +211,12 @@ async fn wifi_task(
 #[embassy_executor::task]
 async fn mqtt_task(
     stack: &'static Stack<'static>,
-    mqtt_server_name: &'static str,
     mqtt_server_port: u16,
     mqtt_username: &'static str,
     mqtt_password: &'static str,
 ) {
     const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
     const KEEP_ALIVE: u16 = 60;
-    const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 
     // Allocate buffers
     let mut rx_buffer = [0; 4096];
@@ -235,20 +225,13 @@ async fn mqtt_task(
     let mut mqtt_tx_buffer = [0; 1024];
 
     loop {
-        let mut mqtt_socket = TcpSocket::new(*stack, &mut rx_buffer, &mut tx_buffer);
-
         info!("Initializing MQTT connection...");
-        // Resolve server address
-        let server_address = match stack.dns_query(mqtt_server_name, embassy_net::dns::DnsQueryType::A).await {
-            Ok(addresses) => addresses.first().cloned(),
-            Err(e) => {
-                error!("DNS resolution failed: {:?}", e);
-                Timer::after(RECONNECT_INTERVAL).await;
-                continue;
-            }
-        };
+        // Wait for Wi-Fi connection and DNS query to be successful
+        while !WIFI_CONNECTION_UP.load(Ordering::SeqCst) {
+            Timer::after(Duration::from_secs(1)).await;
+        }
 
-        let dest = match server_address {
+        let dest = match *DNS_QUERY_RESULT.lock().await {
             Some(addr) => addr,
             None => {
                 error!("No IP address found for MQTT server");
@@ -257,113 +240,142 @@ async fn mqtt_task(
             }
         };
 
+        let mut mqtt_socket = TcpSocket::new(*stack, &mut rx_buffer, &mut tx_buffer);
+
         info!("MQTT server resolved to {}", dest);
         info!("Connecting to MQTT broker at {}:{}", dest, mqtt_server_port);
-        let _connect_result = mqtt_socket
-            .connect(IpEndpoint::new(dest, mqtt_server_port))
-            .await
-            .unwrap();
+        match mqtt_socket.connect(IpEndpoint::new(dest, mqtt_server_port)).await {
+            Ok(()) => {
+                info!("TCP connection established with MQTT broker");
 
-        let mut config = ClientConfig::new(
-            rust_mqtt::client::client_config::MqttVersion::MQTTv5,
-            CountingRng(20000),
-        );
-        config.add_client_id("pico_w");
-        config.add_username(mqtt_username);
-        config.add_password(mqtt_password);
-        config.keep_alive = KEEP_ALIVE;
-
-        let mut mqtt_client = MqttClient::<_, 5, _>::new(
-            mqtt_socket,
-            &mut mqtt_rx_buffer,
-            1024,
-            &mut mqtt_tx_buffer,
-            1024,
-            config,
-        );
-
-        // Set up MQTT socket
-        let mut reconnect_attempts = 0;
-        while reconnect_attempts < MAX_RECONNECT_ATTEMPTS {
-            // Connect to MQTT broker
-            info!("Connecting to MQTT broker...");
-            if let Err(e) = mqtt_client.connect_to_broker().await {
-                error!("Failed to connect to MQTT broker: {:?}", e);
-                reconnect_attempts += 1;
+                // Proceed with MQTT connection
+                setup_and_run_mqtt(mqtt_socket, mqtt_username, mqtt_password, KEEP_ALIVE, RECONNECT_INTERVAL, &mut mqtt_rx_buffer, &mut mqtt_tx_buffer).await
+            }
+            Err(e) => {
+                error!("Failed to establish TCP connection with MQTT broker: {:?}", e);
                 Timer::after(RECONNECT_INTERVAL).await;
-                continue;
             }
-            info!("Connected to MQTT broker successfully");
-
-            // Subscribe to topic
-            info!("Subscribing to topic: armbot/position");
-            if let Err(e) = mqtt_client.subscribe_to_topic("armbot/position").await {
-                error!("Failed to subscribe to topic: {:?}", e);
-                reconnect_attempts += 1;
-                Timer::after(RECONNECT_INTERVAL).await;
-                continue;
-            }
-            info!("Subscribed to topic successfully");
-
-            // Reset reconnect attempts on successful connection
-            reconnect_attempts = 0;
-
-            // Main MQTT loop
-            loop {
-                match mqtt_client.receive_message().await {
-                    Ok((topic, payload)) => {
-                        if topic == "armbot/position" {
-                            // Handle the received message
-                            // control.lock().await.gpio_set(0, true).await;
-                            Timer::after(Duration::from_millis(100)).await;
-
-                            // Parse the JSON payload
-                            match serde_json_core::from_slice::<ArmPositions>(payload) {
-                                Ok((positions, _)) => {
-                                    for (i, position) in positions.iter().enumerate() {
-                                        info!("Position {}: {} - {}",
-                                                    i, position.control_type, position.angle);
-
-                                        // Use the positions array as needed
-                                        let mut json_buffer = [0u8; 256]; // Increased buffer size to accommodate the array
-                                        let json = serde_json_core::to_slice(&position, &mut json_buffer);
-                                        match json {
-                                            Ok(len) => {
-                                                // Send each position as a separate message
-                                                match mqtt_client.send_message(
-                                                    "armbot/test",
-                                                    &json_buffer[..len],
-                                                    rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
-                                                    false,
-                                                ).await {
-                                                    Ok(()) => info!("Sent position {}", i),
-                                                    Err(_e) => error!("Failed to send position {}: {:?}", i, _e),
-                                                }
-                                            }
-                                            Err(_e) => error!("Failed to serialize position {}: {:?}", i, JsonError::ParseFailed),
-                                        }
-                                    }
-                                }
-                                Err(_) => error!("Failed to parse JSON: {:?}", JsonError::ParseFailed),
-                            }
-                        }
-                    }
-
-                    Err(e) => {
-                        error!("MQTT error: {:?}", e);
-                        break; // Break the inner loop to reconnect
-                    }
-                }
-
-                Timer::after(Duration::from_millis(10)).await;
-            }
-
-            // If we've reached here, there was an error, and we need to reconnect
-            error!("MQTT connection lost. Reconnecting...");
-            reconnect_attempts += 1;
-            Timer::after(RECONNECT_INTERVAL).await;
         }
         error!("Max reconnection attempts reached. Waiting before trying again...");
         Timer::after(Duration::from_secs(KEEP_ALIVE as u64)).await;
+    }
+}
+
+async fn setup_and_run_mqtt<T: embedded_io_async::Read + embedded_io_async::Write>(
+    mqtt_socket: T,
+    mqtt_username: &str,
+    mqtt_password: &str,
+    keep_alive: u16,
+    reconnect_interval: Duration,
+    mqtt_rx_buffer: &mut [u8],
+    mqtt_tx_buffer: &mut [u8],
+) {
+    let mut config = ClientConfig::new(
+        rust_mqtt::client::client_config::MqttVersion::MQTTv5,
+        CountingRng(20000),
+    );
+    config.add_client_id("pico_w");
+    config.add_username(mqtt_username);
+    config.add_password(mqtt_password);
+    config.keep_alive = keep_alive;
+
+    let mut mqtt_client = MqttClient::<_, 5, _>::new(
+        mqtt_socket,
+        mqtt_rx_buffer,
+        1024,
+        mqtt_tx_buffer,
+        1024,
+        config,
+    );
+
+    let mut reconnect_attempts = 0;
+    const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+
+    while reconnect_attempts < MAX_RECONNECT_ATTEMPTS {
+        match mqtt_client.connect_to_broker().await {
+            Ok(()) => {
+                info!("Successfully connected to MQTT broker");
+                // Subscribe to the topic
+                match mqtt_client.subscribe_to_topic("armbot/position").await {
+                    Ok(()) => {
+                        info!("Successfully subscribed to topic: armbot/position");
+                        reconnect_attempts = 0;
+
+                        run_mqtt_loop(&mut mqtt_client).await;
+                    }
+                    Err(e) => {
+                        error!("Failed to subscribe to topic: {:?}", e);
+                        reconnect_attempts += 1;
+                        if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
+                            error!("Max reconnection attempts reached.");
+                            return;
+                        }
+                        Timer::after(reconnect_interval).await;
+                        continue;
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to connect to MQTT broker: {:?}", e);
+                reconnect_attempts += 1;
+                Timer::after(Duration::from_secs(5)).await;
+            }
+        }
+    }
+
+    if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
+        error!("Max reconnection attempts reached.");
+        return;
+    }
+}
+
+async fn run_mqtt_loop<'a, T: embedded_io_async::Write + embedded_io_async::Read>(
+    mqtt_client: &'a mut MqttClient<'_, T, 5, CountingRng>
+) {
+    loop {
+        match mqtt_client.receive_message().await {
+            Ok((topic, payload)) => {
+                if topic == "armbot/position" {
+                    // Handle the received message
+                    // control.lock().await.gpio_set(0, true).await;
+                    Timer::after(Duration::from_millis(100)).await;
+
+                    // Parse the JSON payload
+                    match serde_json_core::from_slice::<ArmPositions>(payload) {
+                        Ok((positions, _)) => {
+                            for (i, position) in positions.iter().enumerate() {
+                                info!("Position {}: {} - {}",
+                                                    i, position.control_type, position.angle);
+
+                                // Use the positions array as needed
+                                let mut json_buffer = [0u8; 256]; // Increased buffer size to accommodate the array
+                                let json = serde_json_core::to_slice(&position, &mut json_buffer);
+                                match json {
+                                    Ok(len) => {
+                                        // Send each position as a separate message
+                                        match mqtt_client.send_message(
+                                            "armbot/test",
+                                            &json_buffer[..len],
+                                            rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
+                                            false,
+                                        ).await {
+                                            Ok(()) => info!("Sent position {}", i),
+                                            Err(_e) => error!("Failed to send position {}: {:?}", i, _e),
+                                        }
+                                    }
+                                    Err(_e) => error!("Failed to serialize position {}: {:?}", i, JsonError::ParseFailed),
+                                }
+                            }
+                        }
+                        Err(_) => error!("Failed to parse JSON: {:?}", JsonError::ParseFailed),
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Error receiving MQTT message: {:?}", e);
+                break;
+            }
+        }
+        Timer::after(Duration::from_millis(10)).await;
     }
 }
