@@ -167,7 +167,7 @@ async fn wifi_task(
     const CHECK_INTERVAL_DISCONNECTED: Duration = Duration::from_secs(5);  // Check every 5 seconds when disconnected
     const INITIAL_CHECK_INTERVAL: Duration = Duration::from_millis(100);  // Initial rapid checks
 
-    let mut check_interval = INITIAL_CHECK_INTERVAL;
+    let mut _check_interval = INITIAL_CHECK_INTERVAL;
     info!("Running WiFi task...");
     loop {
         control.gpio_set(0, true).await;
@@ -181,14 +181,14 @@ async fn wifi_task(
                     info!("DNS query successful. Server IP: {}", dest);
                     *DNS_QUERY_RESULT.lock().await = Some(dest);
                     WIFI_CONNECTION_UP.store(true, Ordering::SeqCst);
-                    check_interval = CHECK_INTERVAL_CONNECTED;
+                    _check_interval = CHECK_INTERVAL_CONNECTED;
                     Timer::after(Duration::from_millis(1000)).await;
                 } else {
                     error!("DNS query successful but no addresses returned");
                     info!("WiFi disconnected or DNS query failed. Attempting to reconnect...");
                     WIFI_CONNECTION_UP.store(false, Ordering::SeqCst);
                     *DNS_QUERY_RESULT.lock().await = None;
-                    check_interval = CHECK_INTERVAL_DISCONNECTED;
+                    _check_interval = CHECK_INTERVAL_DISCONNECTED;
                     Timer::after(Duration::from_millis(5000)).await;
                 }
             }
@@ -197,14 +197,14 @@ async fn wifi_task(
                 info!("WiFi disconnected or DNS query failed. Attempting to reconnect...");
                 WIFI_CONNECTION_UP.store(false, Ordering::SeqCst);
                 *DNS_QUERY_RESULT.lock().await = None;
-                check_interval = CHECK_INTERVAL_DISCONNECTED;
+                _check_interval = CHECK_INTERVAL_DISCONNECTED;
                 Timer::after(Duration::from_millis(5000)).await;
             }
         }
         control.gpio_set(0, false).await;
 
         // Sleep for the determined interval
-        Timer::after(check_interval).await;
+        Timer::after(_check_interval).await;
     }
 }
 
