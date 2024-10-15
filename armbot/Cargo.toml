@@ -40,6 +40,7 @@ serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde-json-core = "0.6.0"
 heapless = "0.8"
 
+
 [profile.release]
 debug = 2
 lto = true

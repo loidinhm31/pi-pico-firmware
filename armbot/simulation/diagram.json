@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "author": "Loi Dinh",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "board-pi-pico-w", "id": "pico", "top": 0, "left": 0, "attrs": {} },
+    { "type": "wokwi-servo", "id": "servo1", "top": 17.2, "left": 163.2, "attrs": {} }
+  ],
+  "connections": [
+    [ "pico:GP0", "$serialMonitor:RX", "", [] ],
+    [ "pico:GP1", "$serialMonitor:TX", "", [] ],
+    [ "servo1:PWM", "pico:GP27", "green", [ "h-67.2", "v0.2" ] ],
+    [ "servo1:V+", "pico:3V3", "red", [ "h-67.2", "v-57.5" ] ],
+    [ "servo1:GND", "pico:GND.8", "black", [ "h-48", "v-35.15" ] ]
+  ],
+  "dependencies": {}
+}

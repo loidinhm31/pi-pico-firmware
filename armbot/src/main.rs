@@ -11,20 +11,25 @@ use defmt::*;
 use embassy_executor::Spawner;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{Config, IpAddress, IpEndpoint, Stack, StackResources};
-use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_rp::pwm::{Config as PwmConfig, Pwm};
+use embassy_rp::{bind_interrupts, clocks};
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex};
+use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
+use fixed::types::extra::U4;
+use fixed::FixedU16;
 use rand::RngCore;
 use rust_mqtt::client::client::MqttClient;
 use rust_mqtt::client::client_config::ClientConfig;
 use rust_mqtt::utils::rng_generator::CountingRng;
 use serde::{Deserialize, Serialize};
 use static_cell::StaticCell;
+
 use {defmt_rtt as _, panic_probe as _};
 
 
@@ -50,6 +55,7 @@ static STACK: StaticCell<Stack<'static>> = StaticCell::new();
 static WIFI_CONNECTION_UP: AtomicBool = AtomicBool::new(false);
 static DNS_QUERY_RESULT: Mutex<CriticalSectionRawMutex, Option<IpAddress>> = Mutex::new(None);
 
+static SERVO1_DEGREE: Channel<ThreadModeRawMutex, u32, 1> = Channel::new();
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -142,7 +148,36 @@ async fn main(spawner: Spawner) {
     unwrap!(spawner.spawn(wifi_task(control, stack, mqtt_server_name)));
     unwrap!(spawner.spawn(mqtt_task(stack, mqtt_server_port, mqtt_username, mqtt_password)));
 
+
+    // Configure and initialize PWM module
+    // Integer part
+    let int_part: u16 = 100;
+    // Fractional part (3/16 corresponds to 3 in the 4-bit fractional representation)
+    let frac_part: u16 = 0;
+    let value_bits: u16 = (int_part << 4) | frac_part;
+    let divider: FixedU16<U4> = FixedU16::from_bits(value_bits);
+
+    let system_clock_hz = clocks::clk_sys_freq();
+    let period = 20_u32;
+    let pwm_freq_hz = 1000 / period; // Desired PWM frequency is 50 Hz (Period = 20 ms) f = 1/t
+    let pwd_divider = 100;
+    let top_value = calculate_pwm_top(system_clock_hz, pwm_freq_hz, pwd_divider);
+
+    // Single Arm has 3 joints: init Config & Pwm for first 2 joints
+    let mut c0: PwmConfig = Default::default();
+    c0.divider = divider;
+    c0.top = top_value as u16;
+    let mut pwm0 = Pwm::new_output_b(p.PWM_SLICE5, p.PIN_27, c0.clone());
+    // Init Pio Servo for 3rd join
+
+    // Set duty cycle to make the servo move (pulse width for servos)
+    let min_limit = ((top_value * 500) / (period * 1000)) as u16; // ~2.5% duty (500 µs / 20 ms)
+    let max_limit = ((top_value * 2400) / (period * 1000)) as u16; // ~12% duty (2400 µs / 20 ms)
+
     loop {
+        let val = SERVO1_DEGREE.receive().await;
+        c0.compare_b = map_angle_to_duty(val, 0, 180, min_limit as u32, max_limit as u32) as u16;
+        pwm0.set_config(&c0);
         Timer::after(Duration::from_secs(1)).await;
     }
 }
@@ -163,7 +198,7 @@ async fn wifi_task(
     stack: &'static Stack<'static>,
     mqtt_server_name: &'static str,
 ) {
-    const CHECK_INTERVAL_CONNECTED: Duration = Duration::from_secs(10);  // Check every ? seconds when connected
+    const CHECK_INTERVAL_CONNECTED: Duration = Duration::from_secs(130);  // Check every ? seconds when connected
     const CHECK_INTERVAL_DISCONNECTED: Duration = Duration::from_secs(5);  // Check every 5 seconds when disconnected
     const INITIAL_CHECK_INTERVAL: Duration = Duration::from_millis(100);  // Initial rapid checks
 
@@ -257,7 +292,7 @@ async fn mqtt_task(
             }
         }
         error!("Max reconnection attempts reached. Waiting before trying again...");
-        Timer::after(Duration::from_secs(KEEP_ALIVE as u64)).await;
+        Timer::after(Duration::from_secs(10)).await;
     }
 }
 
@@ -347,23 +382,9 @@ async fn run_mqtt_loop<'a, T: embedded_io_async::Write + embedded_io_async::Read
                                 info!("Position {}: {} - {}",
                                                     i, position.control_type, position.angle);
 
-                                // Use the positions array as needed
-                                let mut json_buffer = [0u8; 256]; // Increased buffer size to accommodate the array
-                                let json = serde_json_core::to_slice(&position, &mut json_buffer);
-                                match json {
-                                    Ok(len) => {
-                                        // Send each position as a separate message
-                                        match mqtt_client.send_message(
-                                            "armbot/test",
-                                            &json_buffer[..len],
-                                            rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
-                                            false,
-                                        ).await {
-                                            Ok(()) => info!("Sent position {}", i),
-                                            Err(_e) => error!("Failed to send position {}: {:?}", i, _e),
-                                        }
-                                    }
-                                    Err(_e) => error!("Failed to serialize position {}: {:?}", i, JsonError::ParseFailed),
+                                if position.control_type == "a" {
+                                    SERVO1_DEGREE.send(position.angle as u32).await;
+                                    Timer::after(Duration::from_millis(500)).await;
                                 }
                             }
                         }
@@ -377,5 +398,30 @@ async fn run_mqtt_loop<'a, T: embedded_io_async::Write + embedded_io_async::Read
             }
         }
         Timer::after(Duration::from_millis(10)).await;
+    }
+}
+
+/// Calculate the TOP value for the given system clock frequency and desired PWM frequency.
+///
+/// # Arguments
+///
+/// * `system_clock_hz` - The system clock frequency in Hz (e.g., 125,000,000 Hz).
+/// * `pwm_freq_hz` - The desired PWM frequency in Hz (e.g., 50 Hz).
+///
+/// # Returns
+///
+/// The TOP value for the PWM timer.
+fn calculate_pwm_top(system_clock_hz: u32, pwm_freq_hz: u32, pwm_divider: u32) -> u32 {
+    system_clock_hz / (pwm_freq_hz * pwm_divider)
+}
+
+// Function that maps one range to another
+fn map_angle_to_duty(deg: u32, in_min: u32, in_max: u32, out_min: u32, out_max: u32) -> u32 {
+    if deg <= 0 {
+        out_min
+    } else if deg >= 180 {
+        out_max
+    } else {
+        out_min + ((deg - in_min) * (out_max - out_min) / (in_max - in_min))
     }
 }
