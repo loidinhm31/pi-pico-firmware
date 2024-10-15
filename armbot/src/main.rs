@@ -49,13 +49,29 @@ type ArmPositions = heapless::Vec<ArmPosition, 16>;
 enum JsonError {
     ParseFailed,
 }
+
+// Define a struct to hold servo configuration
+struct ServoConfig {
+    pwm: Pwm<'static>,
+    pwm_config: PwmConfig,
+    min_duty: u16,
+    max_duty: u16,
+}
+
+// Create a type for our servo command
+#[derive(Clone, Copy)]
+struct ServoCommand {
+    servo_index: usize,
+    angle: u32,
+}
+
 static CONTROL: StaticCell<Control<'static>> = StaticCell::new();
 static STACK: StaticCell<Stack<'static>> = StaticCell::new();
 
 static WIFI_CONNECTION_UP: AtomicBool = AtomicBool::new(false);
 static DNS_QUERY_RESULT: Mutex<CriticalSectionRawMutex, Option<IpAddress>> = Mutex::new(None);
 
-static SERVO1_DEGREE: Channel<ThreadModeRawMutex, u32, 1> = Channel::new();
+static SERVO_COMMAND_CHANNEL: Channel<ThreadModeRawMutex, ServoCommand, 16> = Channel::new();
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -163,21 +179,34 @@ async fn main(spawner: Spawner) {
     let pwd_divider = 100;
     let top_value = calculate_pwm_top(system_clock_hz, pwm_freq_hz, pwd_divider);
 
-    // Single Arm has 3 joints: init Config & Pwm for first 2 joints
     let mut c0: PwmConfig = Default::default();
     c0.divider = divider;
     c0.top = top_value as u16;
-    let mut pwm0 = Pwm::new_output_b(p.PWM_SLICE5, p.PIN_27, c0.clone());
-    // Init Pio Servo for 3rd join
 
-    // Set duty cycle to make the servo move (pulse width for servos)
-    let min_limit = ((top_value * 500) / (period * 1000)) as u16; // ~2.5% duty (500 µs / 20 ms)
-    let max_limit = ((top_value * 2400) / (period * 1000)) as u16; // ~12% duty (2400 µs / 20 ms)
+    let mut servos = [
+        ServoConfig {
+            pwm: Pwm::new_output_b(p.PWM_SLICE5, p.PIN_27, c0.clone()),
+            pwm_config: c0,
+            min_duty: ((top_value * 500) / (period * 1000)) as u16,
+            max_duty: ((top_value * 2400) / (period * 1000)) as u16,
+        }];
 
     loop {
-        let val = SERVO1_DEGREE.receive().await;
-        c0.compare_b = map_angle_to_duty(val, 0, 180, min_limit as u32, max_limit as u32) as u16;
-        pwm0.set_config(&c0);
+        match SERVO_COMMAND_CHANNEL.try_receive() {
+            Ok(command) => {
+                if let Some(servo) = servos.get_mut(command.servo_index) {
+                    let duty = map_angle_to_duty(command.angle, 0, 180, servo.min_duty as u32, servo.max_duty as u32) as u16;
+                    servo.pwm_config.compare_b = duty;
+                    servo.pwm.set_config(&servo.pwm_config);
+                    info!("Servo {} set to angle: {}", command.servo_index, command.angle);
+                } else {
+                    error!("Invalid servo index: {}", command.servo_index);
+                }
+            }
+            Err(_) => {
+                // No command available, continue the loop
+            }
+        }
         Timer::after(Duration::from_secs(1)).await;
     }
 }
@@ -382,10 +411,24 @@ async fn run_mqtt_loop<'a, T: embedded_io_async::Write + embedded_io_async::Read
                                 info!("Position {}: {} - {}",
                                                     i, position.control_type, position.angle);
 
-                                if position.control_type == "a" {
-                                    SERVO1_DEGREE.send(position.angle as u32).await;
-                                    Timer::after(Duration::from_millis(500)).await;
-                                }
+                                let servo_index = match position.control_type.as_str() {
+                                    "a" => 0,
+                                    "b" => 1,
+                                    "c" => 2,
+                                    _ => {
+                                        error!("Unknown control type: {}", position.control_type);
+                                        continue;
+                                    }
+                                };
+
+                                let command = ServoCommand {
+                                    servo_index,
+                                    angle: position.angle as u32,
+                                };
+
+                                SERVO_COMMAND_CHANNEL.send(command).await;
+
+                                Timer::after(Duration::from_millis(250)).await;
                             }
                         }
                         Err(_) => error!("Failed to parse JSON: {:?}", JsonError::ParseFailed),
