@@ -183,13 +183,22 @@ async fn main(spawner: Spawner) {
     c0.divider = divider;
     c0.top = top_value as u16;
 
+    let c1 = c0.clone(); // Same config
+
     let mut servos = [
         ServoConfig {
-            pwm: Pwm::new_output_b(p.PWM_SLICE5, p.PIN_27, c0.clone()),
+            pwm: Pwm::new_output_b(p.PWM_SLICE2, p.PIN_21, c0.clone()),
             pwm_config: c0,
             min_duty: ((top_value * 500) / (period * 1000)) as u16,
             max_duty: ((top_value * 2400) / (period * 1000)) as u16,
-        }];
+        },
+        ServoConfig {
+            pwm: Pwm::new_output_b(p.PWM_SLICE5, p.PIN_27, c1.clone()),
+            pwm_config: c1,
+            min_duty: ((top_value * 500) / (period * 1000)) as u16,
+            max_duty: ((top_value * 2400) / (period * 1000)) as u16,
+        },
+    ];
 
     loop {
         match SERVO_COMMAND_CHANNEL.try_receive() {
