@@ -27,7 +27,6 @@ use rand::RngCore;
 use rust_mqtt::client::client::MqttClient;
 use rust_mqtt::client::client_config::ClientConfig;
 use rust_mqtt::utils::rng_generator::CountingRng;
-use serde::{Deserialize, Serialize};
 use static_cell::StaticCell;
 
 use {defmt_rtt as _, panic_probe as _};
@@ -36,14 +35,6 @@ use {defmt_rtt as _, panic_probe as _};
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
 });
-
-#[derive(Serialize, Deserialize)]
-struct ArmPosition {
-    angle: f32,
-    control_type: heapless::String<3>,
-}
-
-type ArmPositions = heapless::Vec<ArmPosition, 16>;
 
 #[derive(Format)]
 enum JsonError {
@@ -413,34 +404,46 @@ async fn run_mqtt_loop<'a, T: embedded_io_async::Write + embedded_io_async::Read
                     // control.lock().await.gpio_set(0, true).await;
                     Timer::after(Duration::from_millis(100)).await;
 
-                    // Parse the JSON payload
-                    match serde_json_core::from_slice::<ArmPositions>(payload) {
-                        Ok((positions, _)) => {
-                            for (i, position) in positions.iter().enumerate() {
-                                info!("Position {}: {} - {}",
-                                                    i, position.control_type, position.angle);
+                    // Convert payload to string
+                    if let Ok(message) = core::str::from_utf8(payload) {
+                        // Split the message into individual commands
+                        for cmd in message.split(',') {
+                            if cmd.len() == 4 {  // Each command should be exactly 4 characters
+                                let servo_type = &cmd[..1];
+                                let angle_str = &cmd[1..4];
 
-                                let servo_index = match position.control_type.as_str() {
-                                    "a" => 0,
-                                    "b" => 1,
-                                    "c" => 2,
-                                    _ => {
-                                        error!("Unknown control type: {}", position.control_type);
-                                        continue;
-                                    }
-                                };
+                                if let Ok(angle) = angle_str.parse::<u32>() {
+                                    let servo_index = match servo_type {
+                                        "b" => 0, // base
+                                        "s" => 1, // shoulder
+                                        "e" => 2, // elbow
+                                        "g" => 3, // gripper
+                                        _ => {
+                                            error!("Unknown servo type: {}", servo_type);
+                                            continue;
+                                        }
+                                    };
 
-                                let command = ServoCommand {
-                                    servo_index,
-                                    angle: position.angle as u32,
-                                };
+                                    info!("Servo {}: angle {}", servo_index, angle);
 
-                                SERVO_COMMAND_CHANNEL.send(command).await;
+                                    let command = ServoCommand {
+                                        servo_index,
+                                        angle,
+                                    };
 
-                                Timer::after(Duration::from_millis(250)).await;
+                                    SERVO_COMMAND_CHANNEL.send(command).await;
+
+                                    Timer::after(Duration::from_millis(250)).await;
+                                } else {
+                                    error!("Failed to parse angle: {}", angle_str);
+                                }
+                            } else if !cmd.is_empty() {
+                                // This condition handles the case of the trailing empty command after the last comma
+                                error!("Invalid command format: {}", cmd);
                             }
                         }
-                        Err(_) => error!("Failed to parse JSON: {:?}", JsonError::ParseFailed),
+                    } else {
+                        error!("Failed to parse payload as UTF-8");
                     }
                 }
             }
