@@ -5,7 +5,9 @@
   "parts": [
     { "type": "board-pi-pico-w", "id": "pico", "top": 0, "left": 0, "attrs": {} },
     { "type": "wokwi-servo", "id": "servo1", "top": 17.2, "left": 192, "attrs": {} },
-    { "type": "wokwi-servo", "id": "servo2", "top": 161.2, "left": 192, "attrs": {} }
+    { "type": "wokwi-servo", "id": "servo2", "top": 161.2, "left": 192, "attrs": {} },
+    { "type": "wokwi-servo", "id": "servo3", "top": 324.4, "left": 220.8, "attrs": {} },
+    { "type": "wokwi-servo", "id": "servo4", "top": 468.4, "left": 220.8, "attrs": {} }
   ],
   "connections": [
     [ "pico:GP0", "$serialMonitor:RX", "", [] ],
@@ -15,7 +17,13 @@
     [ "servo1:GND", "pico:GND.5", "black", [ "h-57.6", "v105.6" ] ],
     [ "servo2:GND", "pico:GND.5", "black", [ "h-57.6", "v-35.19" ] ],
     [ "servo2:V+", "pico:3V3", "green", [ "h-67.2", "v-172.7" ] ],
-    [ "servo2:PWM", "pico:GP21", "red", [ "h-96", "v-95.8" ] ]
+    [ "servo2:PWM", "pico:GP21", "red", [ "h-96", "v-95.8" ] ],
+    [ "servo3:GND", "pico:GND.5", "black", [ "h-86.4", "v-201.6" ] ],
+    [ "servo3:V+", "pico:3V3", "green", [ "h-96", "v-326.3" ] ],
+    [ "servo3:PWM", "pico:GP13", "red", [ "h-268.8", "v-230.2" ] ],
+    [ "servo4:GND", "pico:GND.5", "black", [ "h-86.4", "v-336" ] ],
+    [ "servo4:V+", "pico:3V3", "green", [ "h-96", "v-470.3" ] ],
+    [ "servo4:PWM", "pico:GP9", "red", [ "h-326.4", "v-441.4" ] ]
   ],
   "dependencies": {}
 }

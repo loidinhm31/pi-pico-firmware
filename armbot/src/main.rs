@@ -36,12 +36,6 @@ bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
 });
 
-#[derive(Format)]
-enum JsonError {
-    ParseFailed,
-}
-
-// Define a struct to hold servo configuration
 struct ServoConfig {
     pwm: Pwm<'static>,
     pwm_config: PwmConfig,
@@ -49,7 +43,6 @@ struct ServoConfig {
     max_duty: u16,
 }
 
-// Create a type for our servo command
 #[derive(Clone, Copy)]
 struct ServoCommand {
     servo_index: usize,
@@ -174,20 +167,39 @@ async fn main(spawner: Spawner) {
     c0.divider = divider;
     c0.top = top_value as u16;
 
+    let min_duty = ((top_value * 500) / (period * 1000)) as u16;
+    let max_duty = ((top_value * 2400) / (period * 1000)) as u16;
+
     let c1 = c0.clone(); // Same config
+
+    let c2 = c0.clone();
+
+    let c3 = c0.clone();
 
     let mut servos = [
         ServoConfig {
-            pwm: Pwm::new_output_b(p.PWM_SLICE2, p.PIN_21, c0.clone()),
-            pwm_config: c0,
-            min_duty: ((top_value * 500) / (period * 1000)) as u16,
-            max_duty: ((top_value * 2400) / (period * 1000)) as u16,
+            pwm: Pwm::new_output_b(p.PWM_SLICE4, p.PIN_9, c0.clone()),
+            pwm_config: c0, // base
+            min_duty,
+            max_duty,
         },
         ServoConfig {
-            pwm: Pwm::new_output_b(p.PWM_SLICE5, p.PIN_27, c1.clone()),
-            pwm_config: c1,
-            min_duty: ((top_value * 500) / (period * 1000)) as u16,
-            max_duty: ((top_value * 2400) / (period * 1000)) as u16,
+            pwm: Pwm::new_output_b(p.PWM_SLICE6, p.PIN_13, c1.clone()),
+            pwm_config: c1, // shoulder
+            min_duty,
+            max_duty,
+        },
+        ServoConfig {
+            pwm: Pwm::new_output_b(p.PWM_SLICE2, p.PIN_21, c2.clone()),
+            pwm_config: c2, // elbow
+            min_duty,
+            max_duty,
+        },
+        ServoConfig {
+            pwm: Pwm::new_output_b(p.PWM_SLICE5, p.PIN_27, c3.clone()),
+            pwm_config: c3, // gripper
+            min_duty,
+            max_duty,
         },
     ];
 
@@ -280,7 +292,7 @@ async fn mqtt_task(
     mqtt_password: &'static str,
 ) {
     const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
-    const KEEP_ALIVE: u16 = 60;
+    const KEEP_ALIVE: u16 = 300;
 
     // Allocate buffers
     let mut rx_buffer = [0; 4096];
@@ -360,9 +372,9 @@ async fn setup_and_run_mqtt<T: embedded_io_async::Read + embedded_io_async::Writ
             Ok(()) => {
                 info!("Successfully connected to MQTT broker");
                 // Subscribe to the topic
-                match mqtt_client.subscribe_to_topic("armbot/position").await {
+                match mqtt_client.subscribe_to_topic("arm_bot/commands").await {
                     Ok(()) => {
-                        info!("Successfully subscribed to topic: armbot/position");
+                        info!("Successfully subscribed to topic: arm_bot/commands");
                         reconnect_attempts = 0;
 
                         run_mqtt_loop(&mut mqtt_client).await;
@@ -399,7 +411,7 @@ async fn run_mqtt_loop<'a, T: embedded_io_async::Write + embedded_io_async::Read
     loop {
         match mqtt_client.receive_message().await {
             Ok((topic, payload)) => {
-                if topic == "armbot/position" {
+                if topic == "arm_bot/commands" {
                     // Handle the received message
                     // control.lock().await.gpio_set(0, true).await;
                     Timer::after(Duration::from_millis(100)).await;
