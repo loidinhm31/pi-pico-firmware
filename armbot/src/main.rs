@@ -55,7 +55,7 @@ static STACK: StaticCell<Stack<'static>> = StaticCell::new();
 static WIFI_CONNECTION_UP: AtomicBool = AtomicBool::new(false);
 static DNS_QUERY_RESULT: Mutex<CriticalSectionRawMutex, Option<IpAddress>> = Mutex::new(None);
 
-static SERVO_COMMAND_CHANNEL: Channel<ThreadModeRawMutex, ServoCommand, 16> = Channel::new();
+static SERVO_COMMAND_CHANNEL: Channel<ThreadModeRawMutex, ServoCommand, 64> = Channel::new();
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -204,22 +204,25 @@ async fn main(spawner: Spawner) {
     ];
 
     loop {
-        match SERVO_COMMAND_CHANNEL.try_receive() {
-            Ok(command) => {
-                if let Some(servo) = servos.get_mut(command.servo_index) {
-                    let duty = map_angle_to_duty(command.angle, 0, 180, servo.min_duty as u32, servo.max_duty as u32) as u16;
-                    servo.pwm_config.compare_b = duty;
-                    servo.pwm.set_config(&servo.pwm_config);
-                    info!("Servo {} set to angle: {}", command.servo_index, command.angle);
-                } else {
-                    error!("Invalid servo index: {}", command.servo_index);
-                }
-            }
-            Err(_) => {
-                // No command available, continue the loop
+        let start = embassy_time::Instant::now();
+
+        // Process all available commands in the channel
+        while let Ok(command) = SERVO_COMMAND_CHANNEL.try_receive() {
+            if let Some(servo) = servos.get_mut(command.servo_index) {
+                let duty = map_angle_to_duty(command.angle, 0, 180, servo.min_duty as u32, servo.max_duty as u32) as u16;
+                servo.pwm_config.compare_b = duty;
+                servo.pwm.set_config(&servo.pwm_config);
+                info!("Servo {} set to angle: {}", command.servo_index, command.angle);
+            } else {
+                error!("Invalid servo index: {}", command.servo_index);
             }
         }
-        Timer::after(Duration::from_secs(1)).await;
+
+        // Ensure we don't process commands too frequently
+        let elapsed = start.elapsed();
+        if elapsed < Duration::from_millis(20) {
+            Timer::after(Duration::from_millis(20) - elapsed).await;
+        }
     }
 }
 
@@ -302,6 +305,7 @@ async fn mqtt_task(
 
     loop {
         info!("Initializing MQTT connection...");
+
         // Wait for Wi-Fi connection and DNS query to be successful
         while !WIFI_CONNECTION_UP.load(Ordering::SeqCst) {
             Timer::after(Duration::from_secs(1)).await;
@@ -316,36 +320,50 @@ async fn mqtt_task(
             }
         };
 
-        let mut mqtt_socket = TcpSocket::new(*stack, &mut rx_buffer, &mut tx_buffer);
-
-        info!("MQTT server resolved to {}", dest);
-        info!("Connecting to MQTT broker at {}:{}", dest, mqtt_server_port);
-        match mqtt_socket.connect(IpEndpoint::new(dest, mqtt_server_port)).await {
+        match connect_and_run_mqtt(
+            stack,
+            dest,
+            mqtt_server_port,
+            mqtt_username,
+            mqtt_password,
+            KEEP_ALIVE,
+            &mut rx_buffer,
+            &mut tx_buffer,
+            &mut mqtt_rx_buffer,
+            &mut mqtt_tx_buffer,
+        ).await {
             Ok(()) => {
-                info!("TCP connection established with MQTT broker");
-
-                // Proceed with MQTT connection
-                setup_and_run_mqtt(mqtt_socket, mqtt_username, mqtt_password, KEEP_ALIVE, RECONNECT_INTERVAL, &mut mqtt_rx_buffer, &mut mqtt_tx_buffer).await
+                info!("MQTT session completed normally");
             }
             Err(e) => {
-                error!("Failed to establish TCP connection with MQTT broker: {:?}", e);
-                Timer::after(RECONNECT_INTERVAL).await;
+                error!("MQTT session error: {:?}", e);
             }
         }
-        error!("Max reconnection attempts reached. Waiting before trying again...");
-        Timer::after(Duration::from_secs(10)).await;
+
+        Timer::after(RECONNECT_INTERVAL).await;
     }
 }
 
-async fn setup_and_run_mqtt<T: embedded_io_async::Read + embedded_io_async::Write>(
-    mqtt_socket: T,
+async fn connect_and_run_mqtt(
+    stack: &Stack<'static>,
+    dest: IpAddress,
+    mqtt_server_port: u16,
     mqtt_username: &str,
     mqtt_password: &str,
     keep_alive: u16,
-    reconnect_interval: Duration,
+    rx_buffer: &mut [u8],
+    tx_buffer: &mut [u8],
     mqtt_rx_buffer: &mut [u8],
     mqtt_tx_buffer: &mut [u8],
-) {
+) -> Result<(), &'static str> {
+    let mut mqtt_socket = TcpSocket::new(*stack, rx_buffer, tx_buffer);
+
+    info!("Connecting to MQTT broker at {}:{}", dest, mqtt_server_port);
+    mqtt_socket.connect(IpEndpoint::new(dest, mqtt_server_port)).await
+        .map_err(|_| "TCP connection failed")?;
+
+    info!("TCP connection established");
+
     let mut config = ClientConfig::new(
         rust_mqtt::client::client_config::MqttVersion::MQTTv5,
         CountingRng(20000),
@@ -364,107 +382,93 @@ async fn setup_and_run_mqtt<T: embedded_io_async::Read + embedded_io_async::Writ
         config,
     );
 
-    let mut reconnect_attempts = 0;
-    const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+    mqtt_client.connect_to_broker().await
+        .map_err(|_| "MQTT broker connection failed")?;
 
-    while reconnect_attempts < MAX_RECONNECT_ATTEMPTS {
-        match mqtt_client.connect_to_broker().await {
-            Ok(()) => {
-                info!("Successfully connected to MQTT broker");
-                // Subscribe to the topic
-                match mqtt_client.subscribe_to_topic("arm_bot/commands").await {
-                    Ok(()) => {
-                        info!("Successfully subscribed to topic: arm_bot/commands");
-                        reconnect_attempts = 0;
+    info!("Connected to MQTT broker");
 
-                        run_mqtt_loop(&mut mqtt_client).await;
-                    }
-                    Err(e) => {
-                        error!("Failed to subscribe to topic: {:?}", e);
-                        reconnect_attempts += 1;
-                        if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
-                            error!("Max reconnection attempts reached.");
-                            return;
-                        }
-                        Timer::after(reconnect_interval).await;
-                        continue;
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to connect to MQTT broker: {:?}", e);
-                reconnect_attempts += 1;
-                Timer::after(Duration::from_secs(5)).await;
-            }
-        }
-    }
+    mqtt_client.subscribe_to_topic("arm_bot/commands").await
+        .map_err(|_| "Topic subscription failed")?;
 
-    if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
-        error!("Max reconnection attempts reached.");
-        return;
-    }
-}
+    info!("Subscribed to arm_bot/commands");
 
-async fn run_mqtt_loop<'a, T: embedded_io_async::Write + embedded_io_async::Read>(
-    mqtt_client: &'a mut MqttClient<'_, T, 5, CountingRng>
-) {
+    // Main MQTT message processing loop
     loop {
         match mqtt_client.receive_message().await {
             Ok((topic, payload)) => {
                 if topic == "arm_bot/commands" {
-                    // Handle the received message
-                    // control.lock().await.gpio_set(0, true).await;
-                    Timer::after(Duration::from_millis(100)).await;
-
-                    // Convert payload to string
-                    if let Ok(message) = core::str::from_utf8(payload) {
-                        // Split the message into individual commands
-                        for cmd in message.split(',') {
-                            if cmd.len() == 4 {  // Each command should be exactly 4 characters
-                                let servo_type = &cmd[..1];
-                                let angle_str = &cmd[1..4];
-
-                                if let Ok(angle) = angle_str.parse::<u32>() {
-                                    let servo_index = match servo_type {
-                                        "b" => 0, // base
-                                        "s" => 1, // shoulder
-                                        "e" => 2, // elbow
-                                        "g" => 3, // gripper
-                                        _ => {
-                                            error!("Unknown servo type: {}", servo_type);
-                                            continue;
-                                        }
-                                    };
-
-                                    info!("Servo {}: angle {}", servo_index, angle);
-
-                                    let command = ServoCommand {
-                                        servo_index,
-                                        angle,
-                                    };
-
-                                    SERVO_COMMAND_CHANNEL.send(command).await;
-
-                                    Timer::after(Duration::from_millis(250)).await;
-                                } else {
-                                    error!("Failed to parse angle: {}", angle_str);
-                                }
-                            } else if !cmd.is_empty() {
-                                // This condition handles the case of the trailing empty command after the last comma
-                                error!("Invalid command format: {}", cmd);
-                            }
-                        }
-                    } else {
-                        error!("Failed to parse payload as UTF-8");
-                    }
+                    process_mqtt_message(payload).await;
                 }
             }
             Err(e) => {
-                error!("Error receiving MQTT message: {:?}", e);
-                break;
+                error!("MQTT receive error: {:?}", e);
+                return Err("MQTT receive failed");
             }
         }
-        Timer::after(Duration::from_millis(10)).await;
+
+        Timer::after(Duration::from_millis(1)).await;
+    }
+}
+
+async fn process_mqtt_message(payload: &[u8]) {
+    if let Ok(message) = core::str::from_utf8(payload) {
+        for cmd in message.split(',') {
+            if cmd.is_empty() {
+                continue;
+            }
+
+            if cmd.len() != 4 {
+                error!("Invalid command length: {}", cmd);
+                continue;
+            }
+
+            let servo_type = &cmd[..1];
+            let angle_str = &cmd[1..4];
+
+            match angle_str.parse::<u32>() {
+                Ok(angle) => {
+                    let servo_index = match servo_type {
+                        "b" => Some(0), // base
+                        "s" => Some(1), // shoulder
+                        "e" => Some(2), // elbow
+                        "g" => Some(3), // gripper
+                        _ => None,
+                    };
+
+                    if let Some(servo_index) = servo_index {
+                        let command = ServoCommand {
+                            servo_index,
+                            angle: angle.min(180),
+                        };
+
+                        // Try to send the command with retries
+                        let mut retries = 0;
+                        while retries < 3 {
+                            match SERVO_COMMAND_CHANNEL.try_send(command) {
+                                Ok(()) => {
+                                    info!("Servo {}: angle {}", servo_index, angle);
+                                    break;
+                                }
+                                Err(_) => {
+                                    retries += 1;
+                                    if retries == 3 {
+                                        error!("Failed to send servo command after retries - channel full");
+                                    }
+                                    Timer::after(Duration::from_millis(5)).await;
+                                }
+                            }
+                        }
+                    } else {
+                        error!("Unknown servo type: {}", servo_type);
+                    }
+                }
+                Err(_) => {
+                    error!("Invalid angle format: {}", angle_str);
+                }
+            }
+        }
+    } else {
+        error!("Invalid UTF-8 in payload");
     }
 }
 
